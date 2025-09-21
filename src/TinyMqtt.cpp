@@ -209,36 +209,52 @@ void MqttBroker::onClient(void* broker_ptr, TcpClient* client)
 }
 
 void MqttBroker::loop() {
-  // Default loop: ~1.5ms budget
-  loopWithBudget(1500);
+  // keep default behavior bounded so the broker never hogs CPU
+  loopWithBudget(1500);  // ~1.5ms
 }
 
 void MqttBroker::loopWithBudget(uint32_t budget_us) {
   if (budget_us == 0) budget_us = 1500;
   const uint32_t deadline = micros() + budget_us;
 
-  // Accept new clients
-  WiFiClient client = _server.available();
-  if (client) {
-    client.setNoDelay(true);   // <-- IMPORTANT
-    addClient(client);
+  // --- Accept one pending client (non-blocking) ---
+  if (server) {
+    TcpClient c = server->available();   // NOTE: server is a pointer
+    if (c) {
+      // Lower latency for one-shot QoS0 publishes
+      c.setNoDelay(true);
+
+      // addClient() needs MqttClient*(MqttBroker*, TcpClient*)
+      // We need a heap TcpClient to hand ownership to MqttClient.
+      TcpClient* pc = new TcpClient();
+      *pc = c;                 // copy the accepted socket into the heap object
+      pc->setNoDelay(true);    // belt-and-braces: ensure NODELAY on the owned socket too
+
+      MqttClient* mc = new MqttClient(this, pc);
+      addClient(mc);
+    }
   }
 
-  // Pump existing clients within budget
-  for (auto it = _clients.begin(); it != _clients.end();) {
-    MqttClient &cl = *it;
-    if (!cl.connected()) {
-      it = _clients.erase(it);
-      continue;
-    }
-    cl.loop();
+  // --- Pump existing clients within budget ---
+  // iterate by index so removal doesn't invalidate iterators
+  for (size_t i = 0; i < clients.size(); /* ++i inside */) {
+    MqttClient* cl = clients[i];
 
+    if (!cl->connected()) {            // your repo uses connected()
+      removeClient(cl);                // deletes & erases from clients
+      if ((int32_t)(deadline - micros()) <= 0) break;
+      continue;                        // don't ++i; next client slid into index i
+    }
+
+    // Non-blocking per-client work
+    cl->loop();
+
+    // Respect time budget so HTTP/PPP stay responsive
     if ((int32_t)(deadline - micros()) <= 0) break;
-    ++it;
+
+    ++i;
   }
 }
-
-
 
 /*
 void MqttBroker::loop()
