@@ -244,7 +244,6 @@ class MqttClient
 
     /** Should be called in main loop() */
     void loop();
-    void loopWithBudget(uint32_t budget_us);
     void close(bool bSendDisconnect=true);
     void setCallback(CallBack fun)
     {
@@ -353,6 +352,7 @@ class MqttBroker
 
     void begin() { server->begin(); }
     void loop();
+    void loopWithBudget(uint32_t budget_us);
 
     /** Connect the broker to a parent broker */
     void connect(const string& host, uint16_t port=1883);
