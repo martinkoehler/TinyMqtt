@@ -208,6 +208,39 @@ void MqttBroker::onClient(void* broker_ptr, TcpClient* client)
   debug("New client");
 }
 
+void MqttBroker::loop() {
+  // Default loop: ~1.5ms budget
+  loopWithBudget(1500);
+}
+
+void MqttBroker::loopWithBudget(uint32_t budget_us) {
+  if (budget_us == 0) budget_us = 1500;
+  const uint32_t deadline = micros() + budget_us;
+
+  // Accept new clients
+  WiFiClient client = _server.available();
+  if (client) {
+    client.setNoDelay(true);   // <-- IMPORTANT
+    addClient(client);
+  }
+
+  // Pump existing clients within budget
+  for (auto it = _clients.begin(); it != _clients.end();) {
+    MqttClient &cl = *it;
+    if (!cl.connected()) {
+      it = _clients.erase(it);
+      continue;
+    }
+    cl.loop();
+
+    if ((int32_t)(deadline - micros()) <= 0) break;
+    ++it;
+  }
+}
+
+
+
+/*
 void MqttBroker::loop()
 {
 #ifndef TINY_MQTT_ASYNC
@@ -240,7 +273,7 @@ void MqttBroker::loop()
       break;
     }
   }
-}
+} */
 
 // Obvioulsy called when the broker is connected to another broker.
 MqttError MqttBroker::subscribe(MqttClient* client, const Topic& topic, uint8_t qos)

@@ -244,6 +244,7 @@ class MqttClient
 
     /** Should be called in main loop() */
     void loop();
+    void loopWithBudget(uint32_t budget_us);
     void close(bool bSendDisconnect=true);
     void setCallback(CallBack fun)
     {
