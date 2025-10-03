@@ -95,6 +95,13 @@ MqttClient::~MqttClient()
   debug("*** MqttClient delete()");
 }
 
+size_t MqttClient::bytesAvailable() const {
+  if (!tcp_client) return 0;               // <-- name may be TcpClient* tcp; adjust if needed
+  return tcp_client->available();
+}
+
+
+
 void MqttClient::close(bool bSendDisconnect)
 {
   debug("close " << id().c_str());
@@ -239,21 +246,24 @@ void MqttBroker::loopWithBudget(uint32_t budget_us) {
   // iterate by index so removal doesn't invalidate iterators
   for (size_t i = 0; i < clients.size(); /* ++i inside */) {
     MqttClient* cl = clients[i];
-
-    if (!cl->connected()) {            // your repo uses connected()
-      removeClient(cl);                // deletes & erases from clients
+    if (!cl->connected()) {
+      // --- NEW: small grace window to drain any last bytes delivered with FIN ---
+      const uint32_t soft_deadline = micros() + 4000;     // ≈4ms max
+      while (cl->bytesAvailable() > 0 && (int32_t)(soft_deadline - micros()) > 0) {
+        cl->loop();                                       // non-blocking parse
+        delay(0);                                         // let WiFi/LWIP breathe
+      }
+      removeClient(cl);                                   // deletes & erases
       if ((int32_t)(deadline - micros()) <= 0) break;
-      continue;                        // don't ++i; next client slid into index i
+      continue;                                           // don't ++i; next slid into i
     }
-
-    // Non-blocking per-client work
-    cl->loop();
-
-    // Respect time budget so HTTP/PPP stay responsive
+  
+    cl->loop();                                           // normal non-blocking pump
+  
     if ((int32_t)(deadline - micros()) <= 0) break;
-
     ++i;
   }
+
 }
 
 /*
@@ -370,6 +380,9 @@ void MqttMessage::getString(const char* &buff, uint16_t& len)
   len = getSize(buff);
   buff+=2;
 }
+
+
+
 
 void MqttClient::clientAlive(uint32_t more_seconds)
 {
@@ -628,7 +641,14 @@ void MqttClient::processMessage(MqttMessage* mesg)
       {
         uint16_t pingreq = MqttMessage::Type::PingResp;
         debug(cyan << "Ping response to client ");
-        tcp_client->write((const char*)(&pingreq), 2);
+        //tcp_client->write((const char*)(&pingreq), 2);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&pingreq);
+        size_t left = 2;
+        while (left > 0) {
+          size_t n = tcp_client->write(p, left);
+          if (n == 0) { delay(0); yield(); continue; }
+          p += n; left -= n;
+        }
         bclose = false;
       }
       else
@@ -991,7 +1011,25 @@ MqttError MqttMessage::sendTo(MqttClient* client)
     debug(cyan << "sending " << buffer.size() << " bytes to " << client->id());
     encodeLength();
     hexdump("Sending ");
-    client->write(&buffer[0], buffer.size());
+
+    // ---- PPP-friendly write: split the payload into <=240B chunks ----
+    const size_t CHUNK = 240;  // keep below PPP MSS (~256 when MTU=296)
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&buffer[0]);
+    size_t remaining = buffer.size();
+    while (remaining > 0) {
+      size_t part = (remaining > CHUNK) ? CHUNK : remaining;
+      size_t n = client->write(p, part);   // uses existing MqttClient::write(...)
+      if (n == 0) {
+        // Backpressure; give lwIP/PPP time to drain
+        delay(0);
+        yield();
+        continue;
+      }
+      p += n;
+      remaining -= n;
+      // Be nice to the scheduler/PPP
+      yield();
+    }
   }
   else
   {

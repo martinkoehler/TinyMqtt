@@ -212,6 +212,10 @@ class MqttClient
   };
   public:
 
+    // Report how many TCP bytes are waiting (non-blocking).
+    size_t bytesAvailable() const;
+
+
     using CallBack = void (*)(const MqttClient* source, const Topic& topic, const char* payload, size_t payload_length);
 
     /** Constructor. Broker is the adress of a local broker if not null
