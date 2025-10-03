@@ -1012,23 +1012,19 @@ MqttError MqttMessage::sendTo(MqttClient* client)
     encodeLength();
     hexdump("Sending ");
 
-    // ---- PPP-friendly write: split the payload into <=240B chunks ----
+    // PPP-friendly chunked write using existing MqttClient::write(const char*, size_t)
     const size_t CHUNK = 240;  // keep below PPP MSS (~256 when MTU=296)
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&buffer[0]);
+    const char* p = &buffer[0];             // TinyMqtt::write expects const char*
     size_t remaining = buffer.size();
+
     while (remaining > 0) {
       size_t part = (remaining > CHUNK) ? CHUNK : remaining;
-      size_t n = client->write(p, part);   // uses existing MqttClient::write(...)
-      if (n == 0) {
-        // Backpressure; give lwIP/PPP time to drain
-        delay(0);
-        yield();
-        continue;
-      }
-      p += n;
-      remaining -= n;
-      // Be nice to the scheduler/PPP
+      client->write(p, part);               // void return in this TinyMqtt
+      p += part;
+      remaining -= part;
+      // Give lwIP/PPP time between chunks
       yield();
+      delay(0);
     }
   }
   else
