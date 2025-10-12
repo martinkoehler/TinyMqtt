@@ -214,6 +214,29 @@ class MqttClient
     // TinyMqtt.h  (public:)
     bool isAlive() const { return tcp_client && tcp_client->connected(); }
 
+    // Reliable small write: tries until all bytes are written or timeout
+    inline bool writeExact(const char* buf, size_t length, uint32_t timeout_ms = 300) {
+      if (!tcp_client || !tcp_client->connected() || !buf || length == 0) return false;
+
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+      size_t off = 0;
+      uint32_t start = millis();
+
+      while (off < length) {
+        if (!tcp_client->connected()) return false;
+
+        size_t w = tcp_client->write(p + off, length - off);
+        if (w == 0) {
+          if (millis() - start > timeout_ms) return false;  // give up
+          yield();
+          continue;
+        }
+        off += w;
+        start = millis(); // progress resets the timer
+        yield();
+      }
+      return true;
+    }
 
     using CallBack = void (*)(const MqttClient* source, const Topic& topic, const char* payload, size_t payload_length);
 

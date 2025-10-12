@@ -1004,18 +1004,17 @@ MqttError MqttMessage::sendTo(MqttClient* client)
   encodeLength();
 
   // --- Parse fixed header (after encodeLength) -------------------------------
-  // buffer layout now: [byte0=type|flags][RL varint (1..4 bytes)] [rest...]
-  const uint8_t* raw   = reinterpret_cast<const uint8_t*>(buffer.data());
-  const size_t   blen  = buffer.size();
+  // buffer: [byte0=type|flags][RL varint (1..4 bytes)] [rest...]
+  const uint8_t* raw  = reinterpret_cast<const uint8_t*>(buffer.data());
+  const size_t   blen = buffer.size();
   if (blen < 2) return MqttInvalidMessage;
 
-  uint8_t h0 = raw[0];
+  uint8_t h0    = raw[0];
   uint8_t mtype = (h0 >> 4) & 0x0F;
   uint8_t flags =  h0       & 0x0F;
 
   // Decode Remaining Length (varint)
-  size_t rl = 0, mul = 1;
-  size_t rl_bytes = 0;
+  size_t rl = 0, mul = 1, rl_bytes = 0;
   for (size_t i = 1; i < blen && i <= 4; ++i) {
     ++rl_bytes;
     rl += (raw[i] & 0x7F) * mul;
@@ -1024,63 +1023,53 @@ MqttError MqttMessage::sendTo(MqttClient* client)
   }
   size_t header_bytes = 1 + rl_bytes;
   if (header_bytes > blen) return MqttInvalidMessage;
-  if (rl != (blen - header_bytes)) {
-    // Remaining length must match payload size
-    return MqttInvalidMessage;
-  }
+  if (rl != (blen - header_bytes)) return MqttInvalidMessage;
 
   // --- Per-type quick validation --------------------------------------------
-  const uint8_t* body = raw + header_bytes;
+  const uint8_t* body    = raw + header_bytes;
   const size_t   body_len = rl;
 
   auto need_exact = [&](size_t n)->bool { return body_len == n; };
   auto need_min   = [&](size_t n)->bool { return body_len >= n; };
 
   switch (mtype) {
-    case 2: { // CONNACK
-      // Must be exactly 2 bytes: [session_present][return_code]
-      if (!need_exact(2)) return MqttInvalidMessage;
+    case 2: // CONNACK
+      if (!need_exact(2)) return MqttInvalidMessage;  // [session_present][rc]
       break;
-    }
-    case 3: { // PUBLISH
-      uint8_t qos = (flags >> 1) & 0x03;
-      if (qos != 0) return MqttInvalidMessage;
 
-      if (!need_min(2)) return MqttInvalidMessage;
- 
+    case 3: { // PUBLISH (fan-out is QoS0 only)
+      uint8_t qos = (flags >> 1) & 0x03;
+      if (qos != 0) return MqttInvalidMessage;        // we only send QoS0
+      if (!need_min(2)) return MqttInvalidMessage;    // need topic length
+
       uint16_t tlen16 = (static_cast<uint16_t>(body[0]) << 8) | body[1];
       size_t   tlen   = static_cast<size_t>(tlen16);
       if ((size_t)2 + tlen > body_len) return MqttInvalidMessage;
+      // QoS0 must NOT include Packet Identifier; our fan-out builds that correctly.
+      break;
+    }
 
-      // QoS0 must NOT include a Packet Identifier — our fan-out builds QoS0 already.
+    case 4: // PUBACK
+      if (!need_exact(2)) return MqttInvalidMessage;  // 2-byte Packet Id
       break;
-    }
-    case 4: { // PUBACK
-      // Must carry exactly a 2-byte Packet Identifier
-      if (!need_exact(2)) return MqttInvalidMessage;
+
+    case 9: // SUBACK
+      if (!need_min(2)) return MqttInvalidMessage;    // PID + N return codes
       break;
-    }
-    case 9: { // SUBACK
-      // At least 2 bytes for Packet Identifier; payload: N return codes
-      if (!need_min(2)) return MqttInvalidMessage;
-      // No further strict check here (we can add one if you count topics earlier)
+
+    case 11: // UNSUBACK
+      if (!need_exact(2)) return MqttInvalidMessage;  // PID only, no payload
       break;
-    }
-    case 11: { // UNSUBACK
-      // Exactly 2 bytes: Packet Identifier; NO payload
-      if (!need_exact(2)) return MqttInvalidMessage;
-      break;
-    }
-    case 13: { // PINGREQ — we never send this from broker
+
+    case 13: // PINGREQ — broker should not send this
       return MqttInvalidMessage;
-    }
-    case 14: { // PINGRESP
-      // No payload
+
+    case 14: // PINGRESP — no payload
       if (!need_exact(0)) return MqttInvalidMessage;
       break;
-    }
+
     default:
-      // Other types: accept as-is (or tighten later if needed)
+      // Accept others as-is (tighten later if needed)
       break;
   }
 
@@ -1088,12 +1077,25 @@ MqttError MqttMessage::sendTo(MqttClient* client)
   hexdump("Sending ");
 #endif
 
-  // Chunked, liveness-aware write (hardened client->write)
-  const char* p = buffer.data();
-  size_t n = buffer.size();
+  const char*  p = buffer.data();
+  const size_t n = buffer.size();
+
+  // Tiny control frames must be delivered fully or not at all
+  bool is_tiny_control =
+      (mtype == 2  /*CONNACK*/)  ||
+      (mtype == 4  /*PUBACK*/)   ||
+      (mtype == 9  /*SUBACK*/)   ||
+      (mtype == 11 /*UNSUBACK*/) ||
+      (mtype == 14 /*PINGRESP*/);
+
+  if (is_tiny_control || n <= 8) {
+    if (!client->writeExact(p, n, 300)) return MqttNowhereToSend;
+    return MqttOk;
+  }
+
+  // Larger frames (e.g., PUBLISH fan-out): chunked, liveness-aware
   const size_t CHUNK = 256;
   size_t off = 0;
-
   while (off < n) {
     if (!client->isAlive()) return MqttNowhereToSend;
     size_t take = (n - off < CHUNK) ? (n - off) : CHUNK;
