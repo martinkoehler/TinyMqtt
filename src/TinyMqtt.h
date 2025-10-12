@@ -237,9 +237,32 @@ class MqttClient
            or (tcp_client and tcp_client->connected());
     }
 
-    void write(const char* buf, size_t length)
+    inline void write(const char* buf, size_t length)
     {
-      if (tcp_client) tcp_client->write(buf, length);
+      if (!tcp_client) return;
+      if (!tcp_client->connected()) return;
+      if (!buf || length == 0) return;
+
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+      size_t off = 0;
+      const size_t CHUNK = 256;   // gentle on lwIP
+
+      while (off < length) {
+        if (!tcp_client->connected()) return;
+
+        size_t take = length - off;
+        if (take > CHUNK) take = CHUNK;
+
+        // WiFiClient::write returns size_t; treat 0 as back-pressure
+        size_t w = tcp_client->write(p + off, take);
+        if (w == 0) {
+          yield();
+          w = tcp_client->write(p + off, take);
+          if (w == 0) return;   // give up this tick; caller will try again later
+        }
+        off += w;
+        yield();
+      }
     }
 
     const string& id() const { return clientId; }

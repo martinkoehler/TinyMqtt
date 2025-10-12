@@ -342,10 +342,12 @@ MqttError MqttBroker::publish(const MqttClient* source, const Topic& topic, Mqtt
         fanout_to_local_clients = true;
       } else {
         // From local → forward upstream as-is (don’t mutate)
-        MqttError ret = remote_broker->publishIfSubscribed(topic, msg);
-        if (ret != MqttOk) retval = ret;
-        // Also deliver to other local clients below
-        fanout_to_local_clients = true;
+        if (remote_broker && remote_broker->isAlive()) {
+          MqttError ret = remote_broker->publishIfSubscribed(topic, msg);
+          if (ret != MqttOk) retval = ret;
+        } else {
+            debug("skip dead remote_broker");
+        }
       }
     }
     else
@@ -385,12 +387,23 @@ MqttError MqttBroker::publish(const MqttClient* source, const Topic& topic, Mqtt
       out.add(payloadPtr, payloadLen, false);
     }
 
+
+    // Skip dead sockets (prevents tcp_output() crash paths)
+    if (!client || !client->isAlive()) {
+      debug("skip dead client");
+      continue;
+    }
+
     // Fan-out to this client if subscribed
     MqttError ret2 = client->publishIfSubscribed(topic, out);
+    if (ret2 == MqttNowhereToSend) {
+      // Socket likely died between the liveness check and write; skip further sends to it.
+      debug("client became dead during send");
+      continue;
+    }
     if (ret2 != MqttOk) {
       retval = ret2;   // keep last non-OK
     }
-
     debug("");
   }
 
@@ -870,26 +883,16 @@ MqttError MqttClient::publish(const Topic& topic, const char* payload, size_t pa
 }
 
 // republish a received publish if it matches any in subscriptions
+
 MqttError MqttClient::publishIfSubscribed(const Topic& topic, MqttMessage& msg)
 {
-  MqttError retval=MqttOk;
+  // Don’t even try if the client isn’t alive
+  if (!(tcp_client && tcp_client->connected())) return MqttNowhereToSend;
 
-  debug("mqttclient publishIfSubscribed " << topic.c_str() << ' ' << subscriptions.size());
-  if (isSubscribedTo(topic))
-  {
-    if (tcp_client)
-      retval = msg.sendTo(this);
-    else
-    {
-      processMessage(&msg);
+  if (!isSubscribedTo(topic)) return MqttOk;
 
-      #if TINY_MQTT_DEBUG
-        Console << "Should call the callback ?\n";
-      #endif
-      // callback(this, topic, nullptr, 0);  // TODO Payload
-    }
-  }
-  return retval;
+  // Send via the already-hardened sendTo()
+  return msg.sendTo(this);
 }
 
 bool MqttClient::isSubscribedTo(const Topic& topic) const
