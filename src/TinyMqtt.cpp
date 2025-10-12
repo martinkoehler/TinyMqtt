@@ -997,30 +997,107 @@ void MqttMessage::encodeLength()
 MqttError MqttMessage::sendTo(MqttClient* client)
 {
   if (!client) return MqttNowhereToSend;
-  if (buffer.empty()) {
-    debug(red << "??? Invalid send");
+  if (buffer.empty()) return MqttInvalidMessage;
+  if (!client->isAlive()) return MqttNowhereToSend;
+
+  // Encode Remaining Length once
+  encodeLength();
+
+  // --- Parse fixed header (after encodeLength) -------------------------------
+  // buffer layout now: [byte0=type|flags][RL varint (1..4 bytes)] [rest...]
+  const uint8_t* raw   = reinterpret_cast<const uint8_t*>(buffer.data());
+  const size_t   blen  = buffer.size();
+  if (blen < 2) return MqttInvalidMessage;
+
+  uint8_t h0 = raw[0];
+  uint8_t mtype = (h0 >> 4) & 0x0F;
+  uint8_t flags =  h0       & 0x0F;
+
+  // Decode Remaining Length (varint)
+  size_t rl = 0, mul = 1;
+  size_t rl_bytes = 0;
+  for (size_t i = 1; i < blen && i <= 4; ++i) {
+    ++rl_bytes;
+    rl += (raw[i] & 0x7F) * mul;
+    if ((raw[i] & 0x80) == 0) break;
+    mul *= 128;
+  }
+  size_t header_bytes = 1 + rl_bytes;
+  if (header_bytes > blen) return MqttInvalidMessage;
+  if (rl != (blen - header_bytes)) {
+    // Remaining length must match payload size
     return MqttInvalidMessage;
   }
 
-  // encode once
-  encodeLength();
+  // --- Per-type quick validation --------------------------------------------
+  const uint8_t* body = raw + header_bytes;
+  const size_t   body_len = rl;
+
+  auto need_exact = [&](size_t n)->bool { return body_len == n; };
+  auto need_min   = [&](size_t n)->bool { return body_len >= n; };
+
+  switch (mtype) {
+    case 2: { // CONNACK
+      // Must be exactly 2 bytes: [session_present][return_code]
+      if (!need_exact(2)) return MqttInvalidMessage;
+      break;
+    }
+    case 3: { // PUBLISH
+      uint8_t qos = (flags >> 1) & 0x03;
+      if (qos != 0) return MqttInvalidMessage;
+
+      if (!need_min(2)) return MqttInvalidMessage;
+ 
+      uint16_t tlen16 = (static_cast<uint16_t>(body[0]) << 8) | body[1];
+      size_t   tlen   = static_cast<size_t>(tlen16);
+      if ((size_t)2 + tlen > body_len) return MqttInvalidMessage;
+
+      // QoS0 must NOT include a Packet Identifier — our fan-out builds QoS0 already.
+      break;
+    }
+    case 4: { // PUBACK
+      // Must carry exactly a 2-byte Packet Identifier
+      if (!need_exact(2)) return MqttInvalidMessage;
+      break;
+    }
+    case 9: { // SUBACK
+      // At least 2 bytes for Packet Identifier; payload: N return codes
+      if (!need_min(2)) return MqttInvalidMessage;
+      // No further strict check here (we can add one if you count topics earlier)
+      break;
+    }
+    case 11: { // UNSUBACK
+      // Exactly 2 bytes: Packet Identifier; NO payload
+      if (!need_exact(2)) return MqttInvalidMessage;
+      break;
+    }
+    case 13: { // PINGREQ — we never send this from broker
+      return MqttInvalidMessage;
+    }
+    case 14: { // PINGRESP
+      // No payload
+      if (!need_exact(0)) return MqttInvalidMessage;
+      break;
+    }
+    default:
+      // Other types: accept as-is (or tighten later if needed)
+      break;
+  }
 
 #if TINY_MQTT_DEBUG
-  debug(cyan << "sending " << buffer.size() << " bytes to " << client->id());
   hexdump("Sending ");
 #endif
 
-  if (!client->isAlive()) return MqttNowhereToSend;
-
-  const char*  p   = buffer.data();   // std::vector<char>
-  const size_t n   = buffer.size();
+  // Chunked, liveness-aware write (hardened client->write)
+  const char* p = buffer.data();
+  size_t n = buffer.size();
   const size_t CHUNK = 256;
-  size_t       off = 0;
+  size_t off = 0;
 
   while (off < n) {
     if (!client->isAlive()) return MqttNowhereToSend;
     size_t take = (n - off < CHUNK) ? (n - off) : CHUNK;
-    client->write(p + off, take);     // TinyMqtt.h: void write(const char*, size_t)
+    client->write(p + off, take);
     off += take;
     yield();
   }
