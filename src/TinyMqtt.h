@@ -127,6 +127,14 @@ class MqttMessage
       Create=6
     };
 
+    // Force the flags (low nibble) of the fixed header.
+    // Assumes the constructor already placed the type in the high nibble.
+    inline void setFlags(uint8_t f) {
+     if (buffer.empty()) return;                 // nothing to do if header not built yet
+      buffer[0] = static_cast<char>((buffer[0] & 0xF0) | (f & 0x0F));
+    }
+
+
     static inline uint32_t getSize(const char* buffer)
     {
       const unsigned char* bun = (const unsigned char*)buffer;
@@ -217,6 +225,7 @@ class MqttClient
     inline void setNoDelay(bool on) {
       if (tcp_client) tcp_client->setNoDelay(on);
     }
+
 
     // Reliable small write: tries until all bytes are written or timeout
     inline bool writeExact(const char* buf, size_t length, uint32_t timeout_ms = 300) {

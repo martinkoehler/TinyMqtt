@@ -372,6 +372,8 @@ MqttError MqttBroker::publish(const MqttClient* source, const Topic& topic, Mqtt
     // We ALWAYS send QoS0 to subscribers (no Packet Identifier, DUP=0, RETAIN=0),
     // regardless of incoming QoS/retain, to avoid protocol errors with strict clients.
     MqttMessage out(MqttMessage::Type::Publish);
+    // Make it an unambiguous QoS0 publish: DUP=0, QoS=0, RETAIN=0
+    out.setFlags(0x00);   // <— this is the key bit for rc=2
 
     // MQTT string for topic: 2-byte big-endian length + bytes
     const std::string& tstr = topic.str();
