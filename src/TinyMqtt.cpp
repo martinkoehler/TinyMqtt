@@ -246,6 +246,8 @@ void MqttBroker::loop()
 
   if (client)
   {
+    // Disable Nagle for this MQTT connection (keepalive/control packets are tiny)
+    client.setNoDelay(true); 
     onClient(this, &client);
   }
 #endif
@@ -642,15 +644,21 @@ void MqttClient::processMessage(MqttMessage* mesg)
       bclose = false;
       break;
 
-    case MqttMessage::Type::PingReq:
+     case MqttMessage::Type::PingReq: {
       if (!mqtt_connected()) break;
-      {
-          MqttMessage resp(MqttMessage::Type::PingResp);
-          if (!(tcp_client && tcp_client->connected())) { bclose = true; break; }
-          resp.sendTo(this);
-          bclose = false;
+      if (!(tcp_client && tcp_client->connected())) { bclose = true; break; }
+
+      // Fast path: send fixed 2-byte PINGRESP, no allocations:
+      const uint8_t resp[2] = { static_cast<uint8_t>((MqttMessage::Type::PingResp << 4) | 0x00), 0x00 };
+      // Use the exact writer so both bytes really go out:
+      if (!writeExact(reinterpret_cast<const char*>(resp), 2, 300)) {
+        // treat as transient—don’t close; main loop will retry if needed
+        // (Or set bclose=true if you want strict behavior.)
+      } else {
+        bclose = false;
       }
       break;
+    }
 
     case MqttMessage::Type::Subscribe:
     case MqttMessage::Type::UnSubscribe:

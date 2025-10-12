@@ -214,6 +214,10 @@ class MqttClient
     // TinyMqtt.h  (public:)
     bool isAlive() const { return tcp_client && tcp_client->connected(); }
 
+    inline void setNoDelay(bool on) {
+      if (tcp_client) tcp_client->setNoDelay(on);
+    }
+
     // Reliable small write: tries until all bytes are written or timeout
     inline bool writeExact(const char* buf, size_t length, uint32_t timeout_ms = 300) {
       if (!tcp_client || !tcp_client->connected() || !buf || length == 0) return false;
