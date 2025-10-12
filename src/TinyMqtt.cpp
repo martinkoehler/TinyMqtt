@@ -707,16 +707,6 @@ void MqttClient::processMessage(MqttMessage* mesg)
         if (ack.sendTo(this) != MqttOk)               { bclose = true; break; }
       }
 
-      // Send SUBACK/UNSUBACK via guarded sendTo
-      {
-        MqttMessage ack(mesg->type() == MqttMessage::Type::Subscribe ? MqttMessage::Type::SubAck
-                                                                     : MqttMessage::Type::UnSuback);
-        ack.add(header[0]);
-        ack.add(header[1]);
-        ack.add(qoss.c_str(), qoss.size(), false);
-        if (ack.sendTo(this) != MqttOk) { bclose = true; break; }
-      }
-
       break;
     }
 
