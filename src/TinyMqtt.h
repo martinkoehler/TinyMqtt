@@ -211,6 +211,9 @@ class MqttClient
     CltFlagToDelete = 2
   };
   public:
+    // TinyMqtt.h  (public:)
+    bool isAlive() const { return tcp_client && tcp_client->connected(); }
+
 
     using CallBack = void (*)(const MqttClient* source, const Topic& topic, const char* payload, size_t payload_length);
 
