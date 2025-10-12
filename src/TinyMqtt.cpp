@@ -156,6 +156,30 @@ void MqttBroker::retainDrop() {
   // Intentionally empty: retained messages disabled/unused in this build.
 }
 
+// TinyMqtt.cpp — add this definition once
+// Signature must match TinyMqtt.h exactly.
+bool MqttBroker::compareString(const char* a, const char* b, uint8_t h) const
+{
+  if (!a || !b) return false;
+
+  if (h == 0) {
+    // Fallback: both are expected to be NUL-terminated
+    return strcmp(a, b) == 0;
+  }
+
+  // Compare exactly the first h bytes
+  if (strncmp(a, b, h) != 0) return false;
+
+  // Optional strictness: treat equality as “same h-length string”
+  // i.e., both are either exactly h bytes long or the next byte is a terminator.
+  const char ta = a[h];
+  const char tb = b[h];
+  const bool a_end = (ta == '\0' || ta == '\r' || ta == '\n');
+  const bool b_end = (tb == '\0' || tb == '\r' || tb == '\n');
+
+  return a_end && b_end;
+}
+
 
 void MqttBroker::addClient(MqttClient* client)
 {
@@ -275,53 +299,104 @@ MqttError MqttBroker::publish(const MqttClient* source, const Topic& topic, Mqtt
 {
   MqttError retval = MqttOk;
 
+  // Keep your retained store as-is (original message)
   retain(topic, msg);
 
+  // ---- Parse incoming PUBLISH once -----------------------------------------
+  const char* vhdr = msg.getVHeader();   // start of variable header (topic length)
+  const char* p    = vhdr;
+  uint16_t    tlen = 0;
+  msg.getString(p, tlen);                // advances 'p' to the MQTT string payload
+  const char* afterTopic = p + tlen;
+
+  // Read QoS/retain from fixed flags
+  uint8_t f   = msg.flags();
+  uint8_t qos = (f >> 1) & 0x03;
+  bool    hasPktId = (qos > 0);
+
+  const char* payloadPtr = afterTopic + (hasPktId ? 2 : 0);
+  size_t      payloadLen = (size_t)(msg.end() - payloadPtr);
+  // --------------------------------------------------------------------------
+
   debug("MqttBroker::publish");
-  int i=0;
-  for(auto client: clients)
+
+  int i = 0;
+  for (auto client : clients)
   {
     i++;
+
 #if TINY_MQTT_DEBUG
-    Console << __LINE__ << " broker:" << (remote_broker && remote_broker->connected() ? "linked" : "alone") <<
-       "  srce=" << (source->isLocal() ? "loc" : "rem") << " clt#" << i << ", local=" << client->isLocal() << ", con=" << client->connected() << endl;
-#endif
-    bool doit = false;
-    if (remote_broker && remote_broker->connected())  // this (MqttBroker) is connected (to a external broker)
-    {
-      // ext_broker -> clients or clients -> ext_broker
-      if (source == remote_broker)  // external broker -> internal clients
-        doit = true;
-      else                  // external clients -> this broker
-      {
-        // As this broker is connected to another broker, simply forward the msg
-        MqttError ret = remote_broker->publishIfSubscribed(topic, msg);
-        if (ret != MqttOk) retval = ret;
-      }
-    }
-    else // Disconnected
-    {
-      doit = true;
-    }
-#if TINY_MQTT_DEBUG
-    Console << ", doit=" << doit << ' ';
+    Console << __LINE__ << " broker:" << (remote_broker && remote_broker->connected() ? "linked" : "alone")
+            << "  srce=" << (source->isLocal() ? "loc" : "rem")
+            << " clt#" << i << ", local=" << client->isLocal()
+            << ", con=" << client->connected() << endl;
 #endif
 
-    if (doit) retval = client->publishIfSubscribed(topic, msg);
+    bool fanout_to_local_clients = false;
+
+    if (remote_broker && remote_broker->connected())
+    {
+      // If this broker is linked upstream:
+      if (source == remote_broker) {
+        // From upstream → deliver to local clients too
+        fanout_to_local_clients = true;
+      } else {
+        // From local → forward upstream as-is (don’t mutate)
+        MqttError ret = remote_broker->publishIfSubscribed(topic, msg);
+        if (ret != MqttOk) retval = ret;
+        // Also deliver to other local clients below
+        fanout_to_local_clients = true;
+      }
+    }
+    else
+    {
+      // Not linked upstream → deliver locally
+      fanout_to_local_clients = true;
+    }
+
+#if TINY_MQTT_DEBUG
+    Console << ", doit=" << fanout_to_local_clients << ' ';
+#endif
+
+    if (!fanout_to_local_clients) {
+      debug("");
+      continue;
+    }
+
+    // ------- Build a QoS0 copy for local subscribers -----------------------
+    // TinyMQTT behaves like a QoS0 broker for local fan-out.
+    // We ALWAYS send QoS0 to subscribers (no Packet Identifier, DUP=0, RETAIN=0),
+    // regardless of incoming QoS/retain, to avoid protocol errors with strict clients.
+    MqttMessage out(MqttMessage::Type::Publish);
+
+    // MQTT string for topic: 2-byte big-endian length + bytes
+    const std::string& tstr = topic.str();
+    uint16_t tlen_be = (uint16_t)tstr.size();
+    out.add((uint8_t)((tlen_be >> 8) & 0xFF));
+    out.add((uint8_t)(tlen_be & 0xFF));
+    if (tlen_be) {
+      out.add(tstr.data(), tstr.size(), false);  // don't copy internally if your API allows
+    }
+
+    // QoS0 publish has NO Packet Identifier
+
+    // Append payload as-is
+    if (payloadLen) {
+      out.add(payloadPtr, payloadLen, false);
+    }
+
+    // Fan-out to this client if subscribed
+    MqttError ret2 = client->publishIfSubscribed(topic, out);
+    if (ret2 != MqttOk) {
+      retval = ret2;   // keep last non-OK
+    }
+
     debug("");
   }
+
   return retval;
 }
 
-bool MqttBroker::compareString(
-    const char* good,
-    const char* str,
-    uint8_t len) const
-{
-  while(len-- and *good++==*str++);
-
-  return *good==0;
-}
 
 void MqttMessage::getString(const char* &buff, uint16_t& len)
 {
@@ -592,6 +667,33 @@ void MqttClient::processMessage(MqttMessage* mesg)
       debug("end loop");
       bclose = false;
 
+      // Packet Identifier is the first two bytes of the SUBSCRIBE/UNSUBSCRIBE variable header
+      const uint8_t pid_msb = static_cast<uint8_t>(header[0]);
+      const uint8_t pid_lsb = static_cast<uint8_t>(header[1]);
+
+      if (mesg->type() == MqttMessage::Type::Subscribe) {
+        // ----- SUBACK (variable header: Packet Id; payload: N return codes) -----
+        MqttMessage ack(MqttMessage::Type::SubAck);
+        ack.add(pid_msb);
+        ack.add(pid_lsb);
+        // Ensure payload length == number of topics parsed
+        // qoss contains 0x00 for QoS0 or 0x80 for failure
+        if (!qoss.empty()) {
+          ack.add(qoss.c_str(), qoss.size(), false);
+        }
+        // Send via hardened path
+        if (!(tcp_client && tcp_client->connected())) { bclose = true; break; }
+        if (ack.sendTo(this) != MqttOk)                { bclose = true; break; }
+
+      } else {
+        // ----- UNSUBACK (variable header: Packet Id; payload: EMPTY) -----
+        MqttMessage ack(MqttMessage::Type::UnSuback);
+        ack.add(pid_msb);
+        ack.add(pid_lsb);
+        if (!(tcp_client && tcp_client->connected())) { bclose = true; break; }
+        if (ack.sendTo(this) != MqttOk)               { bclose = true; break; }
+      }
+
       // Send SUBACK/UNSUBACK via guarded sendTo
       {
         MqttMessage ack(mesg->type() == MqttMessage::Type::Subscribe ? MqttMessage::Type::SubAck
@@ -639,7 +741,7 @@ void MqttClient::processMessage(MqttMessage* mesg)
           if (ID) { id_hi = static_cast<uint8_t>(ID[0]); id_lo = static_cast<uint8_t>(ID[1]); }
           msg.add(id_hi);
           msg.add(id_lo);
-	  if (!isAlive()) { bclose = true; break; }
+          if (!isAlive()) { bclose = true; break; }
           if (msg.sendTo(this) != MqttOk) { bclose = true; break; }
         }
 
@@ -649,7 +751,7 @@ void MqttClient::processMessage(MqttMessage* mesg)
             callback(this, published, payload, len);
           }
         } else {
-	  if (!isAlive()) { bclose = true; break; }
+          if (!isAlive()) { bclose = true; break; }
           debug("publishing to local_broker");
           local_broker->publish(this, published, *mesg);
         }
